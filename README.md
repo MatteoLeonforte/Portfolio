@@ -14,7 +14,8 @@ Here a quick recup.
 - Particle Filter
 
 ## Programming Languages:
-- Python (very good)
-- Matlab (very good)
-- C (good)
-- Java (good)
+- Python - very good [pytorch, torchvision, cProfiler]
+- Matlab - very good
+- C - good
+- Java - good
+
