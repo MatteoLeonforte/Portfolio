@@ -1,1 +1,1081 @@
 
+
+
+A# Acknowledgements
+# Planner:https://gist.github.com/Fnjn/58e5eaa27a3dc004c3526ea82a92de80
+# Controller: https://github.com/idsc-frazzoli/dg-commons/blob/planner/src/dg_commons/sim/agents/lane_follower.py
+# To make the map Polygon, an already made function has been used.
+# For the speed, steer and velocity controllers the dg_common library has been used
+
+# This code was partly given for the course "Planning and Decision Making for Autonomous Robots"
+
+
+import random
+from dataclasses import dataclass
+from typing import Sequence
+
+from commonroad.scenario.lanelet import LaneletNetwork
+from dg_commons import PlayerName
+from dg_commons.sim.goals import PlanningGoal, PolygonGoal
+from dg_commons.sim import SimObservations, InitSimObservations
+from dg_commons.sim.agents import Agent
+from dg_commons.sim.models.obstacles import StaticObstacle
+from dg_commons.sim.models.vehicle import VehicleCommands, VehicleState
+from dg_commons.sim.models.vehicle_structures import VehicleGeometry
+from dg_commons.sim.models.vehicle_utils import VehicleParameters
+
+# MY LIBRARIES
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+import datetime as dt
+from scipy.stats import qmc
+import shapely
+from shapely.strtree import STRtree
+from shapely.geometry import Polygon, LineString, MultiPolygon, Point, box
+from shapely.geometry.base import BaseGeometry
+from random import random
+from matplotlib import collections  as mc
+from collections import deque
+
+from dg_commons.controllers.pure_pursuit import PurePursuit,PurePursuitParam
+from dg_commons.controllers.steer import SteerController
+from dg_commons.controllers.speed import SpeedController, SpeedBehavior, SpeedBehaviorParam
+from dg_commons import SE2Transform
+from dg_commons.maps.lanes import DgLanelet,LaneCtrPoint
+from dg_commons.geo import SE2_from_translation_angle,translation_angle_from_SE2, T2value, SE2_apply_T2
+
+from random import random
+import random as rnd
+from collections import deque
+from scipy import interpolate
+
+
+@dataclass(frozen=True)
+class Pdm4arAgentParams:
+    param1: float = 0.2
+
+
+class Pdm4arAgent(Agent):
+    """This is the PDM4AR agent.
+    Do *NOT* modify the naming of the existing methods and the input/output types.
+    Feel free to add additional methods, objects and functions that help you to solve the task"""
+
+    def __init__(self,
+                 sg: VehicleGeometry,
+                 sp: VehicleParameters
+                 ):
+        self.sg = sg
+        self.sp = sp
+        self.name: PlayerName = None
+        self.goal: PlanningGoal = None
+        self.lanelet_network: LaneletNetwork = None
+        self.static_obstacles: Sequence[StaticObstacle] = None
+
+        # To implement
+        self.params = Pdm4arAgentParams()
+        self.cruiseSpeed = 6
+        
+
+        # Path
+        self.replan = False
+        self.towardsCenter: bool = False
+        self.currentPath: list[tuple] = None
+        self.laneletPath: DgLanelet = None
+        self.laneWidth: float = 1.5*self.sg.w_half
+        self.finalGoal: tuple = None
+        self.num_iter: int = 2000
+        self.safetyDistance = 0.8
+        self.bufferVertix: float = self.sg.length/2+self.safetyDistance
+        self.bufferEdge: float = self.sg.w_half+self.safetyDistance
+        self.radius: float = 10
+        self.stepSize: float = 5
+
+        self.positions: list[tuple] = []
+       
+        # Map
+        self.obstacles_tree: STRtree = None
+        self.obstacles_as_polygons: list[Polygon] = None
+        self.map_size: list[float] = None
+        self.map_center: tuple = None
+        self.map_polygon = compute_map_polygon()
+        
+        # Controller
+        self.pp = PurePursuit(PurePursuitParam.from_vehicle_geo(self.sg))
+        self.pp.along_path = 0
+        self.LFindex = 0
+
+        self.sc = SteerController.from_vehicle_params(self.sp)
+        self.pp.param.look_ahead_minmax = (5,30)#(3,30)
+        self.sc.params.kP = 3#4
+        self.sc.params.kI = 0.1#0.1
+        self.sc.params.kD = 0.2
+
+        self.vc = SpeedController.from_vehicle_params(self.sp)
+        self.desiredVelocity = 0
+        self.vc.reference = self.desiredVelocity
+
+        self.sb: SpeedBehavior = None
+
+        
+        
+
+        
+
+    def on_episode_init(self, init_obs: InitSimObservations):
+        """This method is called by the simulator at the beginning of each episode."""
+        
+        self.name = init_obs.my_name
+
+        # Map initialization
+        self.goal = init_obs.goal
+        self.lanelet_network = init_obs.dg_scenario.lanelet_network
+        self.static_obstacles = list(init_obs.dg_scenario.static_obstacles.values())
+        self.obstacles_as_polygons = obstacles_to_polygons(self.static_obstacles)
+        self.obstacles_tree = STRtree(self.obstacles_as_polygons)
+        obstacles_set = MultiPolygon(self.obstacles_as_polygons)
+        self.map_size = obstacles_set.bounds
+        self.map_center = (-3,17)
+
+        # Goal initialization
+        goalPoly: PolygonGoal = self.goal
+        goalPoint = Point(goalPoly.goal.centroid)
+        self.finalGoal = (goalPoint.x,goalPoint.y)
+
+        # Controller initialization
+        sb_param = SpeedBehaviorParam(self.cruiseSpeed,10,0,0)
+        self.sb = SpeedBehavior(self.name)
+        self.sb.params = sb_param
+
+
+
+    def get_commands(self, sim_obs: SimObservations) -> VehicleCommands:
+        """ This method is called by the simulator at each time step.
+        For instance, this is how you can get your current state from the observations:
+        my_current_state: VehicleState = sim_obs.players[self.name].state
+
+        :param sim_obs:
+        :return:
+        """
+
+        currentState: VehicleState = sim_obs.players[self.name].state
+        startPos = (currentState.x, currentState.y)
+        self.positions.append(startPos)
+        t = float(sim_obs.time)
+
+
+            
+        # PLANNING
+        while self.laneletPath==None:
+            
+            # Reset
+            self.currentPath = None
+            self.laneletPath = None
+
+            # To goal
+            path_to_goal = path_planning(window(startPos,self.finalGoal,self.map_center), startPos,self.finalGoal, self.obstacles_as_polygons, self.map_polygon, self.obstacles_tree, self.num_iter, self.bufferVertix,self.bufferEdge, self.radius, self.stepSize)
+
+            #if path_to_goal is None:
+                #print("Path to center not found. Zero Inputs")
+                
+            if path_to_goal is not None:
+                #print("Path to goal found")
+                self.currentPath = path_to_goal
+                
+            
+            if self.currentPath is not None:
+                #print("Checking lanelet")
+                laneletPath = array_to_lanelet_path(self.currentPath, self.laneWidth, ctrlPoints= True)
+                #map_plot(self.obstacles_as_polygons,self.currentPath,laneletPath.lane_profile(),self.positions,None,startPos,None)
+                
+                if not laneletCollision(laneletPath, self.obstacles_tree, 0):
+                    map_plot(self.obstacles_as_polygons,self.currentPath,laneletPath,None,None,None,None, "Lanelet")
+                    #print("Lanelet has no collisions")
+                    self.desiredVelocity = self.cruiseSpeed
+                    self.laneletPath = laneletPath
+                    self.pp.update_path(self.laneletPath)
+                else:
+                    #print("Lanelet has collisions")
+                    self.laneletPath = None
+                    self.currentPath = None
+
+       
+                
+
+        # CONTROL
+
+        # Current state
+        delta = currentState.delta
+        velocity = currentState.vx
+        self.sb.update_observations(sim_obs.players)
+
+        # No lanePath found -> STOP
+        if self.laneletPath is None:
+
+            self.desiredVelocity = 0
+            referenceDelta = 0
+
+            self.sc.update_measurement(measurement=delta)
+            self.sc.update_reference(referenceDelta)
+            ddelta = self.sc.get_control(t)
+
+            self.vc.update_measurement(measurement=velocity)
+            self.vc.update_reference(reference=self.desiredVelocity)
+            acc = self.vc.get_control(t)
+
+        # lanePath found -> GO
+        else:
+            pose = SE2_from_translation_angle([currentState.x, currentState.y], currentState.psi)
+            lanepose = self.laneletPath.lane_pose_from_SE2_generic(pose)
+            self.pp.update_pose(pose=pose, along_path=lanepose.along_lane)
+            self.pp.update_speed(speed=currentState.vx)
+            referenceDelta = self.pp.get_desired_steering()
+
+            self.sc.update_measurement(measurement=delta)
+            self.sc.update_reference(referenceDelta)
+            ddelta = self.sc.get_control(t)
+
+            ref_speed,_ = self.sb.get_speed_ref(t)
+            self.vc.update_measurement(measurement=velocity)
+            self.vc.update_reference(reference=ref_speed)
+            acc = self.vc.get_control(t)
+
+        
+        return VehicleCommands(acc=acc, ddelta=ddelta)
+
+
+
+
+# MAP
+
+def obstacles_to_polygons(static_obstacles:list[StaticObstacle]) -> list[Polygon]:
+    shapely_obstacles: list[Polygon] = []
+
+    map_x_lb = np.infty
+    map_x_ub = 0.0
+    map_y_lb = np.infty
+    map_y_ub = 0.0
+
+    for obs in static_obstacles:
+        polygon = Polygon(obs.shape) #BaseGeometry
+        shapely_obstacles.append(polygon)
+        x,y = polygon.exterior.xy
+        map_x_lb = min(map_x_lb,min(x))
+        map_x_ub = max(map_x_ub,max(x))
+        map_y_lb = min(map_y_lb,min(y))
+        map_y_ub = max(map_y_ub,max(y))
+    
+    map_size = [map_x_lb,map_x_ub,map_y_lb,map_y_ub]
+
+    return shapely_obstacles
+
+# PATH PLANNING
+
+
+#Structures
+
+class Line():
+    ''' Define line '''
+    def __init__(self, p0, p1):
+        self.p = np.array(p0)
+        self.dirn = np.array(p1) - np.array(p0)
+        self.dist = np.linalg.norm(self.dirn)
+        self.dirn /= self.dist # normalize
+
+    def path(self, t):
+        return self.p + t * self.dirn
+
+class Graph:
+    ''' Define graph '''
+    def __init__(self, startpos: tuple, endpos: tuple):
+        self.startpos = Point(startpos)
+        self.endpos = Point(endpos)
+
+        self.vertices: list[Point] = [self.startpos]
+        self.edges = []
+        self.success = False
+
+        self.vex2idx = {startpos:0}
+        self.neighbors = {0:[]}
+        self.distances = {0:0.}
+
+        self.sx = endpos[0] - startpos[0]
+        self.sy = endpos[1] - startpos[1]
+
+    def add_vex(self, pos: tuple[float]):
+        try:
+            idx = self.vex2idx[pos]
+        except:
+            idx = len(self.vertices)
+            self.vertices.append(Point(pos))
+            self.vex2idx[pos] = idx
+            self.neighbors[idx] = []
+        return idx
+
+    def add_edge(self, idx1, idx2, cost):
+        self.edges.append((idx1, idx2))
+        self.neighbors[idx1].append((idx2, cost))
+        self.neighbors[idx2].append((idx1, cost))
+
+class Graph_PRO:
+    ''' Define graph '''
+    def __init__(self, startpos: tuple, endpos: tuple):
+        self.startpos = Point(startpos)
+        self.endpos = Point(endpos)
+
+        self.vertices: list[Point] = [self.startpos]
+        self.success = False
+
+        self.vex2idx = {startpos:0}
+        self.parent = {0:None}
+        self.distances = {0:0.}
+
+        self.sx = endpos[0] - startpos[0]
+        self.sy = endpos[1] - startpos[1]
+
+    def new_vex(self, pos: tuple[float], parent_idx: int):
+
+        if parent_idx not in self.vex2idx.values():
+            #print("Not existing parent")
+            return
+
+        try:
+            idx = self.vex2idx[pos]
+        except:
+            idx = len(self.vertices)
+            self.vertices.append(Point(pos))
+            self.vex2idx[pos] = idx
+            self.parent[idx] = parent_idx
+            self.distances[idx] = self.distances[parent_idx]+distance(pos,[pos])
+        return idx
+
+    
+
+    def add_edge(self, idx1, idx2, cost):
+        self.edges.append((idx1, idx2))
+        self.neighbors[idx1].append((idx2, cost))
+        self.neighbors[idx2].append((idx1, cost))
+
+
+
+#Auxiliary Functions
+
+def Intersection(line, center, radius):
+    ''' Check line-sphere (circle) intersection '''
+    a = np.dot(line.dirn, line.dirn)
+    b = 2 * np.dot(line.dirn, line.p - center)
+    c = np.dot(line.p - center, line.p - center) - radius * radius
+
+    discriminant = b * b - 4 * a * c
+    if discriminant < 0:
+        return False
+
+    t1 = (-b + np.sqrt(discriminant)) / (2 * a);
+    t2 = (-b - np.sqrt(discriminant)) / (2 * a);
+
+    if (t1 < 0 and t2 < 0) or (t1 > line.dist and t2 > line.dist):
+        return False
+
+    return True
+
+def distance(x: tuple, y: tuple):
+    return np.linalg.norm(np.array(x) - np.array(y))
+
+def nearest(G: Graph, vex:Point, obstacles: STRtree, bufferVertix:float ,bufferEdge: float):
+    Nvex = None
+    Nidx = None
+    minDist = float("inf")
+
+    for idx, v in enumerate(G.vertices):
+        line = LineString([v, vex])
+        if collision(line, obstacles, bufferVertix, bufferEdge):
+            continue
+
+        dist = v.distance(vex)
+        if dist < minDist:
+            minDist = dist
+            Nidx = idx
+            Nvex = v
+
+    return Nvex, Nidx
+
+def newVertex(randvex:Point, nearvex:Point, stepSize:float)->tuple:
+    dirn = np.array([randvex.x,randvex.y]) - np.array([nearvex.x,nearvex.y])
+    length = np.linalg.norm(dirn)
+    dirn = (dirn / length) * min (stepSize, length)
+
+    newvex = (nearvex.x+dirn[0], nearvex.y+dirn[1])
+    return newvex
+
+def window(startpos, endpos, middle = None)->list[float]:
+    ''' Define seach window - 2 times of start to end rectangle'''
+    e = 10
+
+    if middle:
+        min_x = min(endpos[0],startpos[0],middle[0])
+        max_x = max(endpos[0],startpos[0],middle[0])
+        min_y = min(endpos[1],startpos[1],middle[1])
+        max_y = max(endpos[1],startpos[1],middle[1])
+    else:
+        min_x = min(endpos[0],startpos[0])
+        max_x = max(endpos[0],startpos[0])
+        min_y = min(endpos[1],startpos[1])
+        max_y = max(endpos[1],startpos[1])
+    return [min_x-e, min_y-e, max_x+e, max_y+e]
+
+def compute_map_polygon()->Polygon:
+    # line1
+    pointX1 = [-28.643474482791692, -27.07838849845479, -27.07772306502747, -22.885422984595877, -18.34712297279506, -14.129058901035963, -10.186394714003548, -10.185561939449533, -10.18482188700267, -8.2579465477098, -7.480124522588462, -8.734162014175281, -13.14491162493897, -17.374720542668708, -21.39279884337011, -25.162433623748957, -28.623654849090826, -29.902247846634154]
+    pointY1 = [-40.611722424376566, -37.36339421183573, -37.36203935387985, -28.98663919319354, -19.92003916961791, -11.493210946885704, -3.5848827817381785, -3.583401721674943, -3.5818581928775814, -0.025852951216238387, 3.587753800607017, 2.3862131521185854, -2.044878117111345, -10.77400590131113, -19.456530320127513, -28.080293425785353, -36.73999518527468, -39.98330038251306]
+
+
+    #line2
+    pointX2 = [-38.170980424232845, -37.047230586761536, -33.57844868339304, -33.576588861849544, -29.741388861849543, -29.74108032239997, -25.71708032239997, -25.71616162798994, -21.672261627989943, -21.672225427466316, -21.672194275921992, -18.895146772630703, -18.06643758517901, -17.472888573766255, -17.223501189350458, -17.240825324725442, -17.345563592542472, -17.533381210772717, -19.011482239478468, -19.016254116300164, -20.76036514863981, -25.098027091363445, -34.706799736237095, -44.28673985927185, -44.28743276634722, -45.02897433741397]
+    pointY2 = [-35.92515441180569, -33.19509223989309, -24.011863845208776, -24.007285684112897, -15.197285684112897, -15.19658428040675, -6.143084280406751, -6.141077308139802, 2.441622691860198, 2.4416904382469813, 2.4417653467253446, 8.311686146694429, 10.21119373656475, 11.903336062459179, 12.874799463962484, 13.187722328065647, 13.445620575454315, 13.619329827995902, 14.440894244999217, 14.443722590050129, 15.54396322067483, 17.895956790133965, 22.678646787090713, 27.431017083615803, 27.431364169741933, 27.80641332171282]
+
+
+    #line3
+    pointX3 = [-40.73511695375986, -39.99841108085592, -30.4188025954865, -26.462901952922685, -31.05727578779385, -31.06131886846258, -39.70781886846258, -39.70797227074669, -40.28820504873155]
+    pointY3 = [36.29496082723125, 35.92230976010098, 31.170203976695852, 29.21240872812557, 31.677280763232588, 31.679572418537393, 36.84957241853739, 36.84966432863633, 37.19801290011779]
+
+
+    #line4
+    pointX4 = [-35.04829205551827, -34.489046364301984, -25.464267188471673, -16.230565626710018, -14.796802692771534, -13.461044762270278, -11.990316074607312, -10.84197746447667, -9.423510225406911, -8.38694651314312, -7.221143346777812, -5.958847286524004, -1.7615043782679622, 1.991553307252913, 1.9920833282823633, 5.265883328282363, 5.26717281892942, 5.268405086769752, 5.269769786454667, 5.270979412842454, 5.2724286232085245, 5.273831433988017, 5.27545842177097, 5.2769250994222885, 5.278503868223799, 5.280046918430661, 5.2819360990467015, 5.283659978647826, 5.285337981882035, 5.286990812634223, 12.095308247168258, 15.465860246783805]
+    pointY4 = [47.539782736423106, 47.263325638075095, 42.7971731351003, 38.857224920229676, 38.74571222028364, 38.681016259212576, 38.812550473607196, 39.115123885743856, 39.73569710800755, 40.347156575264826, 41.14274653932861, 42.11015227464485, 49.94058418008056, 57.36551128277612, 57.36654490393689, 63.66064490393689, 63.66284546885171, 63.66519947665637, 63.66727729287, 63.669341566383785, 63.67132549056331, 63.673461332620356, 63.67547319110967, 63.67748102746258, 63.679239050548844, 63.68114711568039, 63.683060978761674, 63.68498058860816, 63.686507307773375, 63.68818173303974, 69.93538562045143, 76.50115055552308]
+
+
+    #line5
+    pointX5 = [37.126545722090626, 33.99669995003628, 33.99614915915622, 33.99569111782626, 30.086664947543568, 26.77105835720379, 26.77000878222728, 22.727766062704482, 19.344820883364573, 18.345146735573444, 17.45769714514159, 17.17193473276378, 17.21745214439612, 17.77411434021018, 18.59324561871612, 19.509189036380427, 20.85806636574974, 26.884943698435503, 26.887525839422995, 26.893046738972725, 26.893400465545696, 26.89375598829985, 26.896618046923372, 26.90103009876535, 26.90153525786809, 26.90204654665769, 26.904764360674324, 26.90846964730205, 26.909094776199673, 26.909732121401927, 26.912170739978297, 26.915297079610895, 26.91600647022262, 26.91673553554833, 26.91883997108911, 26.921449710762836, 31.323618474877524, 36.655458047970775, 41.317679683781904]
+    pointY5 = [65.38397867361658, 58.996200352575485, 58.99520264102325, 58.99419850659856, 51.44907817229588, 44.326597366561906, 44.32441231986526, 36.16402983391392, 29.21117566493248, 27.031366711502212, 24.86766778288686, 23.031117930939534, 21.97825917560695, 20.424391613087764, 19.0779014489011, 18.18598406799342, 17.206881934855293, 14.324614307542133, 14.32321635696586, 14.320270668709762, 14.320035881146223, 14.319843403957156, 14.317900197400997, 14.31497167864856, 14.314561636664582, 14.314214495023291, 14.311940546172599, 14.308932933181381, 14.308317361014739, 14.30778410510345, 14.305288421391388, 14.30220987604081, 14.30136293276132, 14.300616806870195, 14.297980008774674, 14.294864233852723, 8.49587454277378, 5.901217925008241, 3.6323742214696813]
+
+
+    #line6
+    pointX6 = [38.02112844845766, 33.506933809961765, 28.060734775092577, 28.060391492341985, 28.06002496019995, 22.19452496019995, 22.194496545537724, 22.194466858105432, 16.342231985805174, 13.41581394586324, 11.427598033214222, 15.465900658825971, 23.495511726091785, 32.17189585413076, 36.717469973277616]
+    pointY6 = [-3.0791866960775454, -0.8818139622677659, 1.769085567961519, 1.7692742965012103, 1.7694345444114536, 4.682034544411454, 4.682050433869904, 4.682063419358353, 7.592811228810192, 8.200156613123623, 8.485743791183188, 5.05880702834735, 0.7826059724388607, -3.4920964522571563, -5.731645898910987]
+
+
+    #line7
+    pointX7 = [31.87001654753195, 27.422502188343568, 18.749163179956582, 16.863670997925688, 14.918275838311752, 12.726661530609736, 10.53603950144253, 8.203570989523522, 6.710631440731921, 5.290307435144637, 4.321383510995733, -0.03391142624890891, -4.411499176732643, -8.749697744658736, -13.07269767839989, -14.467523992419405]
+    pointY7 = [-15.597477264429175, -13.41235178553719, -9.150873668583605, -8.554555976795072, -8.18776285743605, -8.037683623894468, -8.155279583385488, -8.703873955234423, -9.401768671269805, -10.212280727360891, -11.229989495021295, -18.694540719384495, -27.1864131938911, -35.99089847719899, -44.76459834272403, -47.595456042783994]
+
+
+    #ring 1
+    ringX1 = [4.07729544168774, 6.193292121239509, 6.201023701889417, 6.208952743070893, 9.272952743070892, 9.280893422099815, 9.288921953788376, 11.03960273305817, 6.029290749853781, 4.07729544168774]
+    ringY1 = [-2.5656141784444637, -1.720039861437231, -1.7173121707050623, -1.7152269987651816, -1.0424269987651815, -1.0410163365966605, -1.0402501576881398, -0.9442028331396725, 1.5592817173152025, -2.5656141784444637]
+
+
+    #ring 2
+    ringX2 = [-6.355672616412092, -6.364226516274685, -8.693926516274685, -8.702134376776444, -8.710889498042865, -8.720102930312079, -10.95850293031208, -10.970088788556868, -10.982033635561336, -13.088433635561335, -13.09748522478066, -13.10656414071009, -13.115595537579624, -15.421555721809051, -8.72251948603095, -4.685273097957383, -6.348044314183264, -6.355672616412092]
+    ringY2 = [34.016806125353064, 34.00919794251295, 32.164697942512944, 32.15884743544118, 32.153852912578756, 32.14976511698287, 31.288865116982876, 31.285200180421988, 31.282967580748174, 31.020467580748175, 31.01975495377336, 31.019866264810567, 31.020800596221566, 31.36577659465448, 28.113963392120617, 36.115378473263235, 34.025342087753025, 34.016806125353064]
+
+
+    # ring 4
+    ringX4 = [17.015381614615396, 17.009184272908563, 17.003450991711887, 15.633550991711887, 15.626244012194123, 15.620062369939664, 14.595662369939664, 14.591065110924548, 14.587534276709135, 14.566973551526065, 13.569532686725083, 18.1700621753016, 17.02200116409102, 17.015381614615396]
+    ringY4 = [15.748652248662104, 15.754049130422995, 15.759936648040139, 17.287536648040135, 17.296715640509895, 17.30668725780454, 19.198687257804544, 19.208388335518027, 19.218526328859824, 19.289643356426225, 17.218386194076658, 14.969817542843487, 15.743782449722506, 15.748652248662104]
+
+    exterior_x = pointX1 + pointX2 + pointX3 + pointX4 + pointX5 + pointX6 + pointX7 + [pointX1[0]]
+    exterior_y = pointY1 + pointY2 + pointY3 + pointY4 + pointY5 + pointY6 + pointY7 + [pointY1[0]]
+    exterior = [(exterior_x[i], exterior_y[i]) for i in range(len(exterior_x))]
+
+    interior = [[(ringX1[i], ringY1[i]) for i in range(len(ringX1))],[(ringX2[i], ringY2[i]) for i in range(len(ringX2))],[(ringX4[i], ringY4[i]) for i in range(len(ringX4))]]
+    map_polygon = Polygon(exterior, holes=interior)
+
+    return map_polygon
+
+def isInWindow(pos, winx, winy, width, height):
+    ''' Restrict new vertex insides search window'''
+    if winx < pos[0] < winx+width and \
+        winy < pos[1] < winy+height:
+        return True
+    else:
+        return False
+
+def randomPoint(map_size: list[float])->Point:
+    # map_size = [xmin ymin xmax ymax]
+    rand_x, rand_y= np.random.rand(2)
+    width = np.abs(map_size[2]-map_size[0])
+    height = np.abs(map_size[3]-map_size[1])
+    x = map_size[0]+rand_x*width
+    y = map_size[1]+rand_y*height
+    return Point(x,y)
+
+def collision(geom: BaseGeometry, obstacles_tree:STRtree, bufferVertix: float,bufferEdge: float):
+    
+    safety_distance = bufferVertix if isinstance(geom,Point) else bufferEdge
+        
+    dist = geom.distance(obstacles_tree.nearest(geom))
+    if dist<safety_distance:
+        return True
+    return False
+
+def outOfMap(p: tuple, map_polygon: Polygon)->bool:
+    if Point(p).intersects(map_polygon):
+        return False
+    return True
+
+def laneletCollision(lanelet: DgLanelet,obstacles: STRtree, safetyDist: float)-> bool:
+    segments = lanelet.lane_profile()
+    for i in range(len(segments)-1):
+        line = LineString([segments[i], segments[i+1]])
+        dist = line.distance(obstacles.nearest(line))
+        if dist<safetyDist:
+            return True
+    return False
+        
+def RRT_star(map_size, startpos:tuple, endpos: tuple, obstacles_poly: list[Polygon], obstacles: STRtree, map_polygon: Polygon, n_iter, bufferVertix: float,bufferEdge: float, radius, stepSize)->Graph:
+    ''' RRT star algorithm '''
+    G = Graph(startpos, endpos)
+
+    n_refinements = 0
+    pathDraft: list[tuple] = None
+
+    for _ in range(n_iter):
+
+        if n_refinements>150:
+            #print("End refinement")
+            break
+
+        if not G.success:
+            randvex = randomPoint(map_size)
+
+        else:
+            n_refinements+=1
+            rnd_idx = rnd.randint(0,len(pathDraft)-1)
+            rnd_p = pathDraft[rnd_idx]
+            randvex = randomPoint([rnd_p[0]-10,rnd_p[1]-10,rnd_p[0]+10,rnd_p[1]+10])
+
+
+        if collision(randvex, obstacles, bufferVertix, bufferEdge) or outOfMap([randvex.x,randvex.y],map_polygon):
+            continue
+
+        nearvex, nearidx = nearest(G, randvex, obstacles, bufferVertix, bufferEdge)
+        if nearvex is None:
+            continue
+
+        newvex = newVertex(randvex, nearvex, stepSize)
+
+        newidx = G.add_vex(newvex)
+        dist = Point(newvex).distance(nearvex)
+        G.add_edge(newidx, nearidx, dist)
+        G.distances[newidx] = G.distances[nearidx] + dist
+
+        # update nearby vertices distance (if shorter)
+        for vex in G.vertices:
+            vex_tuple = (vex.x,vex.y)
+            if vex_tuple == newvex:
+                continue
+
+            dist = distance(vex_tuple, newvex)
+            if dist > radius or dist<3: #I added dist<3
+                continue
+
+            line = LineString([vex_tuple, newvex])
+            if collision(line, obstacles, bufferVertix, bufferEdge):
+                continue
+
+            idx = G.vex2idx[vex_tuple]
+            if G.distances[newidx] + dist < G.distances[idx]:
+                G.add_edge(idx, newidx, dist)
+                G.distances[idx] = G.distances[newidx] + dist
+
+        end_tuple = (G.endpos.x,G.endpos.y)
+        dist = distance(newvex, end_tuple)
+
+        #if dist < 2*radius
+        if not collision(LineString([newvex, end_tuple]),obstacles, bufferVertix, bufferEdge):
+            
+            endidx = G.add_vex(end_tuple)
+            G.add_edge(newidx, endidx, dist)
+            try:
+                G.distances[endidx] = min(G.distances[endidx], G.distances[newidx]+dist)
+            except:
+                G.distances[endidx] = G.distances[newidx]+dist
+
+            # Path found for the first time
+            if not G.success:
+                pathDraft = dijkstra(G)
+                #print("Path found. Start refinement")
+            G.success = True
+        
+    return G
+
+def dijkstra(G: Graph):
+    ''' Dijkstra algorithm for finding shortest path from start position to end.'''
+    srcIdx = G.vex2idx[(G.startpos.x,G.startpos.y)]
+    dstIdx = G.vex2idx[(G.endpos.x,G.endpos.y)]
+
+    # build dijkstra
+    nodes = list(G.neighbors.keys())
+    dist = {node: float('inf') for node in nodes}
+    prev = {node: None for node in nodes}
+    dist[srcIdx] = 0
+
+    while nodes:
+        curNode = min(nodes, key=lambda node: dist[node])
+        nodes.remove(curNode)
+        if dist[curNode] == float('inf'):
+            break
+
+        for neighbor, cost in G.neighbors[curNode]:
+            newCost = dist[curNode] + cost
+            if newCost < dist[neighbor]:
+                dist[neighbor] = newCost
+                prev[neighbor] = curNode
+
+    # retrieve path
+    path = deque()
+    curNode = dstIdx
+    while prev[curNode] is not None:
+        p = G.vertices[curNode]
+        path.appendleft([p.x,p.y])
+        curNode = prev[curNode]
+    p = G.vertices[curNode]
+    path.appendleft([p.x,p.y])
+    return list(path)
+
+def dynamic_obstacle_check(obs:SimObservations, player: PlayerName):
+    obs = obs.players[player]
+    return
+
+
+#Main Planning
+
+def path_planning(map_size: list[float], startPos: tuple,endPos: tuple, obstacles_poly:list[Polygon], map_polygon:Polygon, obstacles: STRtree, num_iter: int, bufferVertix: float,bufferEdge: float, radius: float, stepSize: float) -> list[tuple]:
+    G = RRT_star(map_size, startPos, endPos, obstacles_poly, obstacles, map_polygon, num_iter, bufferVertix, bufferEdge, radius, stepSize)
+    if G.success:
+        map_plot(obstacles_poly,None,None,None,G,None,None, "Graph")
+        path = dijkstra(G)
+        map_plot(obstacles_poly,path,None,None,None,None,None, "Path")
+        s_path = smoothing_function(path)
+        map_plot(obstacles_poly,s_path,None,path,None,None,None, "Smooth path")
+        return s_path
+        
+        
+
+def smoothing_function(path: list[tuple])->list[tuple]:
+    # Source: https://www.youtube.com/watch?v=ueUgHvUT2Z0
+    # Interpolate big distances
+    ctrl_points = []
+    prev = None
+    for p in path:
+        if prev is None:
+            ctrl_points.append(p)
+            prev = p
+            continue
+
+        d = distance(prev,p)
+        if d>4:
+            num = int(d//4)
+            x_list = np.linspace(start=prev[0], stop=p[0], num=num)
+            y_list = np.linspace(start=prev[1], stop=p[1], num=num)
+            for i in range(len(x_list)):
+                ctrl_points.append((x_list[i],y_list[i]))
+    
+        else:
+            ctrl_points.append(p)
+        prev = p
+
+    x = []
+    y = []
+    prev = None
+    for p in ctrl_points:
+        if prev is None:
+            x.append(p[0])
+            y.append(p[1])
+            prev = p
+            continue
+
+        d = distance(prev,p)
+        if d<1:
+            prev = p
+            continue
+
+        else:
+            x.append(p[0])
+            y.append(p[1])
+            prev = p
+
+    path_ext = []
+    for i in range(len(x)):
+        path_ext.append((x[i],y[i]))
+
+    try:
+        tck, *rest = interpolate.splprep([x,y], k=3,s=1)
+    except:
+        #map_plot(None,path_ext,None,None,None,None,None)
+        return path
+    #tck -> knots - coefficients - degree
+
+    u = np.linspace(0,1,num=50)
+    smooth = interpolate.splev(u,tck)
+    smooth_path = []
+    for i in range(50):
+        x = smooth[0][i]
+        y = smooth[1][i]
+        smooth_path.append((x,y))
+
+    
+    return smooth_path
+
+# PATH TRACKING (OLD)
+
+def pure_pursuit_step (path, currentPos, currentHeading,L, lookAheadDis, LFindex, accumulatedError) :
+
+    # extract currentX and currentY
+    currentX = currentPos[0]
+    currentY = currentPos[1]
+
+    # use for loop to search intersections
+    lastFoundIndex = LFindex
+    intersectFound = False
+    startingIndex = lastFoundIndex
+
+    for i in range (startingIndex, len(path)-1):
+
+        # beginning of line-circle intersection code
+        x1 = path[i][0] - currentX
+        y1 = path[i][1] - currentY
+        x2 = path[i+1][0] - currentX
+        y2 = path[i+1][1] - currentY
+        dx = x2 - x1
+        dy = y2 - y1
+        dr = math.sqrt (dx**2 + dy**2)
+        D = x1*y2 - x2*y1
+        discriminant = (lookAheadDis**2) * (dr**2) - D**2
+
+        if discriminant >= 0:
+            sol_x1 = (D * dy + sgn(dy) * dx * np.sqrt(discriminant)) / dr**2
+            sol_x2 = (D * dy - sgn(dy) * dx * np.sqrt(discriminant)) / dr**2
+            sol_y1 = (- D * dx + abs(dy) * np.sqrt(discriminant)) / dr**2
+            sol_y2 = (- D * dx - abs(dy) * np.sqrt(discriminant)) / dr**2
+
+            sol_pt1 = [sol_x1 + currentX, sol_y1 + currentY]
+            sol_pt2 = [sol_x2 + currentX, sol_y2 + currentY]
+            # end of line-circle intersection code
+
+            minX = min(path[i][0], path[i+1][0])
+            minY = min(path[i][1], path[i+1][1])
+            maxX = max(path[i][0], path[i+1][0])
+            maxY = max(path[i][1], path[i+1][1])
+
+            # if one or both of the solutions are in range
+            if ((minX <= sol_pt1[0] <= maxX) and (minY <= sol_pt1[1] <= maxY)) or ((minX <= sol_pt2[0] <= maxX) and (minY <= sol_pt2[1] <= maxY)):
+
+                foundIntersection = True
+
+                # if both solutions are in range, check which one is better
+                if ((minX <= sol_pt1[0] <= maxX) and (minY <= sol_pt1[1] <= maxY)) and ((minX <= sol_pt2[0] <= maxX) and (minY <= sol_pt2[1] <= maxY)):
+                    # make the decision by compare the distance between the intersections and the next point in path
+                    if pt_to_pt_distance(sol_pt1, path[i+1]) < pt_to_pt_distance(sol_pt2, path[i+1]):
+                        goalPt = sol_pt1
+                    else:
+                        goalPt = sol_pt2
+        
+                # if not both solutions are in range, take the one that's in range
+                else:
+                    # if solution pt1 is in range, set that as goal point
+                    if (minX <= sol_pt1[0] <= maxX) and (minY <= sol_pt1[1] <= maxY):
+                        goalPt = sol_pt1
+                    else:
+                        goalPt = sol_pt2
+          
+                # only exit loop if the solution pt found is closer to the next pt in path than the current pos
+                if pt_to_pt_distance (goalPt, path[i+1]) < pt_to_pt_distance ([currentX, currentY], path[i+1]):
+                    # update lastFoundIndex and exit
+                    lastFoundIndex = i
+                    break
+                else:
+                    # in case for some reason the robot cannot find intersection in the next path segment, but we also don't want it to go backward
+                    lastFoundIndex = i+1
+        
+            # if no solutions are in range
+            else:
+                foundIntersection = False
+                # no new intersection found, potentially deviated from the path
+                # follow path[lastFoundIndex]
+                goalPt = [path[lastFoundIndex][0], path[lastFoundIndex][1]]
+
+        # if determinant < 0
+        else:
+            foundIntersection = False
+            # no new intersection found, potentially deviated from the path
+            # follow path[lastFoundIndex]
+            goalPt = [path[lastFoundIndex][0], path[lastFoundIndex][1]]
+
+    # Matteo
+    lateralError = pt_to_segment_distance(currentPos,[path[lastFoundIndex][0], path[lastFoundIndex][1]],[path[lastFoundIndex+1][0], path[lastFoundIndex+1][1]])
+    accumulatedError += lateralError
+    
+    # calculate absTargetAngle with the atan2 function
+    pointTargetAngle = math.atan2 (goalPt[1]-currentPos[1], goalPt[0]-currentPos[0])
+    pointTargetAngle_norm = pointTargetAngle
+    if pointTargetAngle < 0: pointTargetAngle_norm += 2*np.pi
+
+    currentHeading_norm = currentHeading
+    if currentHeading<0: currentHeading_norm+=2*np.pi
+
+    # compute alpha error by finding the minimum angle
+    alpha = pointTargetAngle_norm - currentHeading_norm
+    if alpha > np.pi or alpha < -np.pi :
+        alpha = -1 * sgn(alpha) * (2*np.pi - abs(alpha))
+
+
+    # Compute heading error
+    segmentAngle = math.atan2 (goalPt[1]-path[lastFoundIndex][1], goalPt[0]-path[lastFoundIndex][0])
+    segmentAngle_norm = segmentAngle
+    if segmentAngle<0: segmentAngle_norm+=2*np.pi
+
+    headingError = segmentAngle_norm-currentHeading
+    if headingError > np.pi or headingError < -np.pi :
+        headingError = -1 * sgn(alpha) * (2*np.pi - abs(alpha))
+
+    
+    
+    
+    # apply proportional controller
+    steerAngle_pp = math.atan((2*L*np.sin(alpha))/lookAheadDis)
+    steerAngle_p = 0.3*(lateralError+(lookAheadDis*np.sin(headingError)))
+    steerAngle_i = -0.2*accumulatedError
+
+    steerAngle = steerAngle_pp+steerAngle_p+steerAngle_i
+
+    # PLOT
+    plt.plot(goalPt[0],goalPt[1],'x')
+    plt.plot(currentPos[0],currentPos[1],'o',linewidth=0.5) 
+
+    x_path = []
+    y_path = []
+    for p in path:
+        x_path.append(p[0])
+        y_path.append(p[1])
+
+    
+
+    plt.plot(x_path,y_path,'--',linewidth=0.2)
+    message = '#######################'+'\nHeading: ' + str(currentHeading)+'\nPath Heading: '+str(segmentAngle)+'\nPoint-Target Angle: '+str(pointTargetAngle)+'\n\nsteerAngle_pp '+str(steerAngle_pp)+'\nsteerAngle_p: '+str(steerAngle_p)+'\n steerAngle_i : '+str(steerAngle_i)+'\n\n steerAngle TOT : '+str(steerAngle)
+    print(message)
+    plt.savefig("Plot")
+
+    return goalPt, lastFoundIndex, steerAngle, lateralError
+
+def pt_to_pt_distance (pt1,pt2):
+    distance = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
+    return distance
+
+def pt_to_segment_distance(pt,p1,p2):
+    
+    num = abs((p2[0]-p1[0])*(p1[1]-pt[1])-(p1[0]-pt[0])*(p2[1]-p1[1]))
+    den = np.sqrt((p2[0]-p1[0])**2+(p2[1]-p1[1])**2)
+
+    dir_21 = np.arctan2(p2[1]-p1[1],p2[0]-p1[0])
+    dir_p1 = np.arctan2(pt[1]-p1[1],pt[0]-p1[0])
+    ###CAREFULL
+    sign = 1 if dir_p1<dir_21 else -1
+
+    return sign*num/den
+
+def sgn (num):
+    if num >= 0:
+        return 1
+    else:
+        return -1
+
+def find_goal_point(path, currentPos, lookAheadDis, LFindex):
+
+    # extract currentX and currentY
+    currentX = currentPos[0]
+    currentY = currentPos[1]
+
+    # use for loop to search intersections
+    lastFoundIndex = LFindex
+    intersectFound = False
+    startingIndex = lastFoundIndex
+
+    for i in range (startingIndex, len(path)-1):
+
+        # beginning of line-circle intersection code
+        x1 = path[i][0] - currentX
+        y1 = path[i][1] - currentY
+        x2 = path[i+1][0] - currentX
+        y2 = path[i+1][1] - currentY
+        dx = x2 - x1
+        dy = y2 - y1
+        dr = math.sqrt (dx**2 + dy**2)
+        D = x1*y2 - x2*y1
+        discriminant = (lookAheadDis**2) * (dr**2) - D**2
+
+        if discriminant >= 0:
+            sol_x1 = (D * dy + sgn(dy) * dx * np.sqrt(discriminant)) / dr**2
+            sol_x2 = (D * dy - sgn(dy) * dx * np.sqrt(discriminant)) / dr**2
+            sol_y1 = (- D * dx + abs(dy) * np.sqrt(discriminant)) / dr**2
+            sol_y2 = (- D * dx - abs(dy) * np.sqrt(discriminant)) / dr**2
+
+            sol_pt1 = [sol_x1 + currentX, sol_y1 + currentY]
+            sol_pt2 = [sol_x2 + currentX, sol_y2 + currentY]
+            # end of line-circle intersection code
+
+            minX = min(path[i][0], path[i+1][0])
+            minY = min(path[i][1], path[i+1][1])
+            maxX = max(path[i][0], path[i+1][0])
+            maxY = max(path[i][1], path[i+1][1])
+
+            # if one or both of the solutions are in range
+            if ((minX <= sol_pt1[0] <= maxX) and (minY <= sol_pt1[1] <= maxY)) or ((minX <= sol_pt2[0] <= maxX) and (minY <= sol_pt2[1] <= maxY)):
+
+                foundIntersection = True
+
+                # if both solutions are in range, check which one is better
+                if ((minX <= sol_pt1[0] <= maxX) and (minY <= sol_pt1[1] <= maxY)) and ((minX <= sol_pt2[0] <= maxX) and (minY <= sol_pt2[1] <= maxY)):
+                    # make the decision by compare the distance between the intersections and the next point in path
+                    if pt_to_pt_distance(sol_pt1, path[i+1]) < pt_to_pt_distance(sol_pt2, path[i+1]):
+                        goalPt = sol_pt1
+                    else:
+                        goalPt = sol_pt2
+        
+                # if not both solutions are in range, take the one that's in range
+                else:
+                    # if solution pt1 is in range, set that as goal point
+                    if (minX <= sol_pt1[0] <= maxX) and (minY <= sol_pt1[1] <= maxY):
+                        goalPt = sol_pt1
+                    else:
+                        goalPt = sol_pt2
+          
+                # only exit loop if the solution pt found is closer to the next pt in path than the current pos
+                if pt_to_pt_distance (goalPt, path[i+1]) < pt_to_pt_distance ([currentX, currentY], path[i+1]):
+                    # update lastFoundIndex and exit
+                    lastFoundIndex = i
+                    break
+                else:
+                    # in case for some reason the robot cannot find intersection in the next path segment, but we also don't want it to go backward
+                    lastFoundIndex = i+1
+        
+            # if no solutions are in range
+            else:
+                foundIntersection = False
+                # no new intersection found, potentially deviated from the path
+                # follow path[lastFoundIndex]
+                goalPt = [path[lastFoundIndex][0], path[lastFoundIndex][1]]
+
+        # if determinant < 0
+        else:
+            foundIntersection = False
+            # no new intersection found, potentially deviated from the path
+            # follow path[lastFoundIndex]
+            goalPt = [path[lastFoundIndex][0], path[lastFoundIndex][1]]
+
+    return goalPt, lastFoundIndex
+
+# CONTROLLER FROM LIBRARIES
+
+def array_to_lanelet_path(arrayPath:list,  laneWidth: float,ctrlPoints: bool)->DgLanelet:
+
+    if ctrlPoints:
+        laneCtrPoints: list[LaneCtrPoint] = []
+        lastTheta = None
+        for i in range(len(arrayPath)-1):
+
+            currPoint = arrayPath[i]
+            nextPoint = arrayPath[i+1]
+
+            dy = nextPoint[1]-currPoint[1]
+            dx = nextPoint[0]-currPoint[0]
+
+            next_theta = np.arctan2(dy,dx)
+
+            if not lastTheta:
+                currTheta = next_theta
+            else:
+                # Map to [0,2pi]
+                if next_theta<0:
+                    next_theta += 2*np.pi
+                if lastTheta<0:
+                    lastTheta += 2*np.pi
+
+                currTheta = 0.5*(next_theta+lastTheta)
+
+                # Map back to [-pi,pi]
+                if currTheta>np.pi:
+                    currTheta -= 2*np.pi
+
+            ctrlPoint = LaneCtrPoint(SE2Transform(currPoint,currTheta),laneWidth)
+            laneCtrPoints.append(ctrlPoint)
+
+            lastTheta = currTheta
+
+        lastCtrlPoint = LaneCtrPoint(SE2Transform(arrayPath[-1],lastTheta),laneWidth)
+        laneCtrPoints.append(lastCtrlPoint)
+
+        return DgLanelet(laneCtrPoints)
+    
+    else:
+        return DgLanelet.from_vertices(np.array(arrayPath),np.array(arrayPath),np.array(arrayPath))
+
+
+# PLOT
+
+def plot(arrayPath: list[T2value], arrayPose: list, goalPose: tuple):
+
+    plt.plot(arrayPose[0],arrayPose[1],'o',linewidth=0.2) 
+
+    x_path = []
+    y_path = []
+    for p in arrayPath:
+        
+        x_path.append(p[0])
+        y_path.append(p[1])
+
+    plt.plot(x_path,y_path,'--',linewidth=0.2)
+
+    if goalPose is not None:
+        plt.plot(goalPose[0],goalPose[1],'x',linewidth=0.2) 
+
+    plt.savefig("Plot")
+
+    return
+
+def map_plot(obstacle_list: list[Polygon], path: list[tuple], lanelet:list[tuple], positions:list[tuple], graph:Graph, pos:tuple, lookahead: tuple, name: str):
+    #plt.close()
+    if obstacle_list is not None:
+        for obs in obstacle_list:
+            x,y = obs.exterior.xy
+            plt.plot(x,y, 'k',linewidth=1)
+
+    if path is not None:
+        prev = None
+        for p in path:
+            if prev is not None:
+                plt.plot([prev[0],p[0]],[prev[1],p[1]],'r-', linewidth = 0.4)
+            prev = p
+
+    if lanelet is not None:
+        prev = None
+        for p in lanelet:
+            if prev is not None:
+                plt.plot([prev[0],p[0]],[prev[1],p[1]],'b-', linewidth = 0.25)
+            prev = p
+
+    if positions is not None:
+        prev = None
+        for p in positions:
+            if prev is not None:
+                plt.plot([prev[0],p[0]],[prev[1],p[1]],'g-', linewidth = 0.25)
+            prev = p
+
+    if graph is not None:
+        for n1 in graph.neighbors.keys():
+            for n2 in graph.neighbors[n1]:
+                p1 = graph.vertices[n1]
+                p2 = graph.vertices[n2[0]]
+                plt.plot([p1.x,p2.x],[p1.y,p2.y],'r-',linewidth=0.4)
+
+        
+    if pos is not None:
+        plt.plot(pos[0],pos[1],'o',linewidth=0.5)
+
+    if lookahead is not None:
+        plt.plot(lookahead[0],lookahead[1],'x',linewidth=0.2)
+    
+    plt.axis('equal')
+    plt.grid(True)
+    plt.savefig(name, dpi = 1000)
+    plt.close()
