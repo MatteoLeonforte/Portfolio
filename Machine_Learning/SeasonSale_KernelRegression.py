@@ -1,6 +1,3 @@
-# This serves as a template which will guide you through the implementation of this task.  It is advised
-# to first read the whole template and get a sense of the overall structure of the code before trying to fill in any of the TODO gaps
-# First, we import necessary libraries:
 import numpy as np
 import pandas as pd
 import math
@@ -10,8 +7,6 @@ from sklearn import preprocessing
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import  SimpleImputer ,KNNImputer, IterativeImputer
 
-
-########## MY FUNCTIONS - START
 
 def season2bool(season_vector):
 
@@ -76,8 +71,6 @@ def crossValidation(X,y, kernelType, n_splits=10, alpha=1, gamma=1, normalize=Fa
 
     avg_RMSE = np.mean(RMSE_vector)
     return avg_RMSE
-
-########## MY FUNCTIONS - END
 
     
 def data_loading():
