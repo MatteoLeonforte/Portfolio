@@ -16,6 +16,12 @@ Here a quick recup.
 - Extended Kalman Filter
 - Particle Filter
 
+### Personal
+- Sudoku Solver
+- Google HashCode Competition 2020
+- Reply Challenge 2021
+- Ticket-Sharing App
+
 ## Programming Languages:
 - Python - very good [pytorch, torchvision, cProfiler]
 - Matlab - very good
